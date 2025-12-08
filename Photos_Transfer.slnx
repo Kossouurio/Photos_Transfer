@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Photos_Transfer/Photos_Transfer.vcxproj" Id="9d6dec7c-6adb-4234-85e5-b7b564fe937f" />
+</Solution>
