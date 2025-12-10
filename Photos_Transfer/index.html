@@ -1,235 +1,4 @@
-﻿#include "Server.h"
-#include "FileHandler.h"
-#include <iostream>
-#include <sstream>
-#include <vector>
-#include <windows.h>
-#include <direct.h>
-#include <time.h>
-
-Server::Server(int port) : port_(port), listenSocket_(INVALID_SOCKET), isRunning_(false) {
-    CreateUploadDirectory();
-}
-
-Server::~Server() {
-    Stop();
-}
-
-void Server::CreateUploadDirectory() {
-    char path[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, path);
-    uploadDirectory_ = std::string(path) + "\\Uploads";
-    _mkdir(uploadDirectory_.c_str());
-}
-
-std::string Server::GetUploadDirectory() const {
-    return uploadDirectory_;
-}
-
-std::string Server::GetCurrentDateTime() {
-    time_t now = time(0);
-    struct tm timeinfo;
-    localtime_s(&timeinfo, &now);
-    char buffer[80];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    return std::string(buffer);
-}
-
-bool Server::Start() {
-    listenSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSocket_ == INVALID_SOCKET) {
-        std::cerr << "Erreur lors de la creation du socket: " << WSAGetLastError() << '\n';
-        return false;
-    }
-    
-    sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(port_);
-    
-    if (bind(listenSocket_, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        std::cerr << "Erreur lors du bind: " << WSAGetLastError() << '\n';
-        closesocket(listenSocket_);
-        return false;
-    }
-    
-    if (listen(listenSocket_, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "Erreur lors du listen: " << WSAGetLastError() << '\n';
-        closesocket(listenSocket_);
-        return false;
-    }
-    
-    isRunning_ = true;
-    
-    while (isRunning_) {
-        SOCKET clientSocket = accept(listenSocket_, nullptr, nullptr);
-        if (clientSocket == INVALID_SOCKET) {
-            continue;
-        }
-        
-        HandleClient(clientSocket);
-        closesocket(clientSocket);
-    }
-    
-    return true;
-}
-
-void Server::Stop() {
-    isRunning_ = false;
-    if (listenSocket_ != INVALID_SOCKET) {
-        closesocket(listenSocket_);
-        listenSocket_ = INVALID_SOCKET;
-    }
-}
-
-void Server::HandleClient(SOCKET clientSocket) {
-    char buffer[4096];
-    int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-    
-    if (bytesReceived <= 0) {
-        return;
-    }
-    
-    buffer[bytesReceived] = '\0';
-    std::string request(buffer);
-    
-    if (request.find("GET / ") == 0 || request.find("GET /index.html") == 0) {
-        std::string response = "HTTP/1.1 200 OK\r\n";
-        response += "Content-Type: text/html; charset=utf-8\r\n";
-        response += "Connection: close\r\n\r\n";
-        response += GetHTMLPage();
-        SendResponse(clientSocket, response);
-    }
-    else if (request.find("POST /upload") == 0) {
-        std::string contentType;
-        size_t ctPos = request.find("Content-Type:");
-        if (ctPos != std::string::npos) {
-            size_t endPos = request.find("\r\n", ctPos);
-            contentType = request.substr(ctPos + 13, endPos - ctPos - 13);
-            while (contentType[0] == ' ') contentType.erase(0, 1);
-        }
-        
-        std::string boundary = ExtractBoundary(contentType);
-        if (!boundary.empty()) {
-            HandleFileUpload(clientSocket, request, boundary);
-        } else {
-            std::string response = "HTTP/1.1 400 Bad Request\r\n";
-            response += "Content-Type: text/plain\r\n";
-            response += "Connection: close\r\n\r\n";
-            response += "Boundary non trouve";
-            SendResponse(clientSocket, response);
-        }
-    }
-    else {
-        std::string response = "HTTP/1.1 404 Not Found\r\n";
-        response += "Content-Type: text/plain\r\n";
-        response += "Connection: close\r\n\r\n";
-        response += "Page non trouvee";
-        SendResponse(clientSocket, response);
-    }
-}
-
-void Server::HandleFileUpload(SOCKET clientSocket, const std::string& headers, const std::string& boundary) {
-    std::vector<char> fileData;
-    char buffer[8192];
-    
-    size_t headerEnd = headers.find("\r\n\r\n");
-    if (headerEnd != std::string::npos) {
-        std::string initialData = headers.substr(headerEnd + 4);
-        fileData.insert(fileData.end(), initialData.begin(), initialData.end());
-    }
-    
-    while (true) {
-        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (bytesReceived <= 0) break;
-        fileData.insert(fileData.end(), buffer, buffer + bytesReceived);
-        
-        std::string tempData(fileData.begin(), fileData.end());
-        if (tempData.find("--" + boundary + "--") != std::string::npos) {
-            break;
-        }
-    }
-    
-    std::string data(fileData.begin(), fileData.end());
-    
-    std::string filename;
-    size_t filenamePos = data.find("filename=\"");
-    if (filenamePos != std::string::npos) {
-        filenamePos += 10;
-        size_t filenameEnd = data.find("\"", filenamePos);
-        filename = data.substr(filenamePos, filenameEnd - filenamePos);
-    }
-    
-    size_t dataStart = data.find("\r\n\r\n");
-    if (dataStart != std::string::npos) {
-        dataStart += 4;
-        size_t dataEnd = data.find("--" + boundary, dataStart);
-        if (dataEnd != std::string::npos) {
-            dataEnd -= 2;
-            
-            std::string filepath = uploadDirectory_ + "\\" + filename;
-            FileHandler fileHandler;
-            if (fileHandler.SaveFile(filepath, data.substr(dataStart, dataEnd - dataStart))) {
-                std::cout << "[" << GetCurrentDateTime() << "] Fichier recu: " << filename 
-                         << " (" << (dataEnd - dataStart) << " octets)" << '\n';
-                
-                std::string response = "HTTP/1.1 200 OK\r\n";
-                response += "Content-Type: text/plain\r\n";
-                response += "Connection: close\r\n\r\n";
-                response += "Fichier telecharge avec succes: " + filename;
-                SendResponse(clientSocket, response);
-                return;
-            }
-        }
-    }
-    
-    std::string response = "HTTP/1.1 500 Internal Server Error\r\n";
-    response += "Content-Type: text/plain\r\n";
-    response += "Connection: close\r\n\r\n";
-    response += "Erreur lors de l'enregistrement du fichier";
-    SendResponse(clientSocket, response);
-}
-
-std::string Server::ExtractBoundary(const std::string& contentType) {
-    size_t pos = contentType.find("boundary=");
-    if (pos != std::string::npos) {
-        return contentType.substr(pos + 9);
-    }
-    return "";
-}
-
-void Server::SendResponse(SOCKET clientSocket, const std::string& response) {
-    send(clientSocket, response.c_str(), static_cast<int>(response.length()), 0);
-}
-
-std::string Server::GetHTMLPage() {
-    // Try to load external index.html from the working directory
-    char workingDir[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, workingDir);
-    
-    std::string indexPath = std::string(workingDir) + "\\index.html";
-    std::cout << "Trying to load external HTML from: " << indexPath << std::endl;
-    
-    HANDLE hFile = CreateFileA(indexPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD fileSize = GetFileSize(hFile, NULL);
-        if (fileSize > 0) {
-            std::string content;
-            content.resize(fileSize);
-            DWORD bytesRead = 0;
-            if (ReadFile(hFile, &content[0], fileSize, &bytesRead, NULL) && bytesRead == fileSize) {
-                CloseHandle(hFile);
-                std::cout << "Successfully loaded external HTML file" << std::endl;
-                return content;
-            }
-        }
-        CloseHandle(hFile);
-    }
-    
-    std::cout << "Using embedded HTML (external file not found)" << std::endl;
-
-    // Fallback: embedded HTML
-    return R"(<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
@@ -390,12 +159,12 @@ std::string Server::GetHTMLPage() {
 </head>
 <body>
     <div class="container">
-        <h1>📱➡️💻</h1>
+        <h1>&#x1F4F1;&#x27A1;&#x1F4BB;</h1>
         <h1>Transfert de Fichiers</h1>
         <p class="subtitle">Envoyez vos photos et videos facilement</p>
         
         <div class="upload-area" id="uploadArea">
-            <div class="upload-icon">📤</div>
+            <div class="upload-icon">&#x1F4E4;</div>
             <div class="upload-text">Cliquez ou glissez vos fichiers ici</div>
             <div class="upload-hint">Photos et videos acceptees</div>
         </div>
@@ -504,12 +273,12 @@ std::string Server::GetHTMLPage() {
             }
             
             if (errorCount === 0) {
-                status.innerHTML = `<div class="status success">✅ ${successCount} fichier(s) transfere(s) avec succes !</div>`;
+                status.innerHTML = `<div class="status success">&#x2705; ${successCount} fichier(s) transfere(s) avec succes !</div>`;
                 selectedFiles = [];
                 fileList.innerHTML = '';
                 fileInput.value = '';
             } else {
-                status.innerHTML = `<div class="status error">❌ ${successCount} succes, ${errorCount} echec(s)</div>`;
+                status.innerHTML = `<div class="status error">&#x274C; ${successCount} succes, ${errorCount} echec(s)</div>`;
             }
             
             uploadBtn.disabled = selectedFiles.length === 0;
@@ -522,5 +291,4 @@ std::string Server::GetHTMLPage() {
         });
     </script>
 </body>
-</html>)";
-}
+</html>

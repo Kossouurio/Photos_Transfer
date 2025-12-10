@@ -36,5 +36,6 @@
   <ItemGroup>
     <None Include="Photos_Transfer.vcxproj" />
     <None Include="README.md" />
+    <None Include="index.html" />
   </ItemGroup>
 </Project>
